@@ -1,70 +1,40 @@
 CREATE KEYSPACE IF NOT EXISTS zipkin WITH replication = {'class': 'SimpleStrategy', 'replication_factor': '1'};
 
-CREATE TABLE IF NOT EXISTS zipkin.service_span_name_index (
-    service_span_name text,      // Endpoint.serviceName + "." + Span.name
-    ts                timestamp, // start timestamp of the span, truncated to millisecond precision
-    trace_id          bigint,    // trace ID. Included as a clustering column to avoid clashes (however unlikely)
-    PRIMARY KEY (service_span_name, ts, trace_id)
-)
-    WITH CLUSTERING ORDER BY (ts DESC)
-    AND compaction = {'class': 'org.apache.cassandra.db.compaction.DateTieredCompactionStrategy', 'max_window_size_seconds': '86400'}
-    AND default_time_to_live =  259200;
-
-CREATE TABLE IF NOT EXISTS zipkin.service_name_index (
-    service_name      text,      // Endpoint.serviceName
-    bucket            int,       // avoids hot spots by distributing writes across each bucket, usually 0-9
-    ts                timestamp, // start timestamp of the span, truncated to millisecond precision
-    trace_id          bigint,    // trace ID. Included as a clustering column to avoid clashes (however unlikely)
-    PRIMARY KEY ((service_name, bucket), ts, trace_id)
-)
-    WITH CLUSTERING ORDER BY (ts DESC)
-    AND compaction = {'class': 'org.apache.cassandra.db.compaction.DateTieredCompactionStrategy', 'max_window_size_seconds': '86400'}
-    AND default_time_to_live =  259200;
-
-CREATE TABLE IF NOT EXISTS zipkin.span_names (
+CREATE TYPE IF NOT EXISTS zipkin.endpoint (
     service_name text,
-    bucket       int,   -- no longer used. kept for compatibility
-    span_name    text,
-    PRIMARY KEY ((service_name, bucket), span_name)
-)
-    WITH compaction = {'class': 'org.apache.cassandra.db.compaction.LeveledCompactionStrategy', 'unchecked_tombstone_compaction': 'true', 'tombstone_threshold': '0.2'}
-    AND default_time_to_live =  259200;
+    ipv4         inet,
+    ipv6         blob,
+    port         smallint,
+);
 
-CREATE TABLE IF NOT EXISTS zipkin.annotations_index (
-    annotation     blob,      // Annotation.value or BinaryAnnotation.key
-    bucket         int,       // avoids hot spots by distributing writes across each bucket, usually 0-9
-    ts             timestamp, // start timestamp of the span, truncated to millisecond precision
-    trace_id       bigint,    // trace ID. Included as a clustering column to avoid clashes (however unlikely)
-    PRIMARY KEY ((annotation, bucket), ts, trace_id)
-)
-    WITH CLUSTERING ORDER BY (ts DESC)
-    AND compaction = {'class': 'org.apache.cassandra.db.compaction.DateTieredCompactionStrategy', 'max_window_size_seconds': '86400'}
-    AND default_time_to_live =  259200;
+CREATE TYPE IF NOT EXISTS zipkin.annotation (
+    ts bigint,
+    v  text,
+    ep frozen<endpoint>
+);
 
-CREATE TABLE IF NOT EXISTS zipkin.dependencies (
-    day          timestamp,
-    dependencies blob,
-    PRIMARY KEY (day)
-)
-    WITH compaction = {'class': 'org.apache.cassandra.db.compaction.LeveledCompactionStrategy', 'unchecked_tombstone_compaction': 'true', 'tombstone_threshold': '0.2'}
-    AND default_time_to_live =  259200;
-
-CREATE TABLE IF NOT EXISTS zipkin.service_names (
-    service_name text,
-    PRIMARY KEY (service_name)
-)
-    WITH compaction = {'class': 'org.apache.cassandra.db.compaction.LeveledCompactionStrategy', 'unchecked_tombstone_compaction': 'true', 'tombstone_threshold': '0.2'}
-    AND default_time_to_live =  259200;
+CREATE TYPE IF NOT EXISTS zipkin.binary_annotation (
+    k  text,
+    v  text,
+    t  text,
+    ep frozen<endpoint>
+);
 
 CREATE TABLE IF NOT EXISTS zipkin.traces (
-    trace_id  bigint,
-    ts        timestamp,
-    span_name text,
-    span      blob,
-    PRIMARY KEY (trace_id, ts, span_name)
+    trace               bigint,
+    ts                  timestamp,
+    id                  bigint,
+    name                text,
+    parent              bigint,
+    duration            bigint,
+    annotations         list<frozen<annotation>>,
+    binary_annotations  list<frozen<binary_annotation>>,
+    all_annotations     text,
+    PRIMARY KEY (trace, ts, id)
 )
-    WITH compaction = {'class': 'org.apache.cassandra.db.compaction.DateTieredCompactionStrategy', 'max_window_size_seconds': '86400'}
+    WITH compaction = {'class': 'org.apache.cassandra.db.compaction.TimeWindowCompactionStrategy'}
     AND default_time_to_live =  604800;
+
 
 CREATE TABLE zipkin.service_span_name_index (
     service_name  text,      // service name
@@ -75,6 +45,35 @@ CREATE TABLE zipkin.service_span_name_index (
     duration      bigint,    // span duration, in microseconds
     PRIMARY KEY ((service_name, span_name, bucket), ts)
 )
-    WITH CLUSTERING ORDER BY (ts DESC)
-    AND compaction = {'class': 'org.apache.cassandra.db.compaction.DateTieredCompactionStrategy', 'max_window_size_seconds': '86400'}
+   WITH CLUSTERING ORDER BY (ts DESC)
+    AND compaction = {'class': 'org.apache.cassandra.db.compaction.TimeWindowCompactionStrategy'}
     AND default_time_to_live =  259200;
+
+
+CREATE MATERIALIZED VIEW IF NOT EXISTS zipkin.service_names
+    AS SELECT service_name, span_name, bucket, ts, trace_id FROM service_span_name_index
+            WHERE service_name is not null AND span_name is not null AND bucket is not null AND ts is not null
+            PRIMARY KEY (service_name, span_name, bucket, ts)
+        WITH compaction = {'class': 'org.apache.cassandra.db.compaction.LeveledCompactionStrategy', 'unchecked_tombstone_compaction': 'true', 'tombstone_threshold': '0.2'}
+        AND default_time_to_live =  259200;
+
+CREATE CUSTOM INDEX ON zipkin.traces (all_annotations) USING 'org.apache.cassandra.index.sasi.SASIIndex'
+   WITH OPTIONS = {
+    'mode': 'CONTAINS',
+    'analyzed': 'true',
+    'analyzer_class':'org.apache.cassandra.index.sasi.analyzer.NonTokenizingAnalyzer',
+    'case_sensitive': 'false'
+   };
+
+CREATE CUSTOM INDEX ON zipkin.service_span_name_index (duration) USING 'org.apache.cassandra.index.sasi.SASIIndex'
+   WITH OPTIONS = {'mode': 'PREFIX'}    ;
+
+
+CREATE TABLE IF NOT EXISTS zipkin.dependencies (
+    day          timestamp,
+    dependencies blob,
+    PRIMARY KEY (day)
+)
+    WITH compaction = {'class': 'org.apache.cassandra.db.compaction.LeveledCompactionStrategy', 'unchecked_tombstone_compaction': 'true', 'tombstone_threshold': '0.2'}
+    AND default_time_to_live =  259200;
+
